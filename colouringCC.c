@@ -5,233 +5,305 @@
 #include "mmio.h"
 #include "converter.h"
 
-struct timespec t_start, t_end;
+static void get_range(int N, int p, int r, int *start, int *count) {
+    int base = N / p;
+    int rem  = N % p;
 
-int world_size;
-int world_rank;
-
-void broadcast_large_array(int *array, int size, int root) {
-   
-    const int MAX_MPI_SIZE = 100000000; 
-
-    if (size <= MAX_MPI_SIZE) {
-
-        MPI_Bcast(array, size, MPI_INT, root, MPI_COMM_WORLD);
-        if (world_rank == 0) {
-            printf("Broadcasted array (%d elements) in single message\n", size);
-            fflush(stdout);
-        }
+    if (r < rem) {
+        *count = base + 1;
+        *start = r * (*count);
     } else {
-
-        int num_chunks = (size + MAX_MPI_SIZE - 1) / MAX_MPI_SIZE;
-        
-        
-        for (int chunk = 0; chunk < num_chunks; chunk++) {
-            int offset = chunk * MAX_MPI_SIZE;
-            int chunk_size = (offset + MAX_MPI_SIZE > size) ? (size - offset) : MAX_MPI_SIZE;
-            
-            MPI_Bcast(array + offset, chunk_size, MPI_INT, root, MPI_COMM_WORLD);
-            
-            if (world_rank == 0) {
-                printf("  Chunk %d/%d: %d elements (%.2f MB)\n", 
-                       chunk + 1, num_chunks, chunk_size,
-                       (chunk_size * sizeof(int)) / (1024.0 * 1024.0));
-                fflush(stdout);
-            }
-        }
-        
-        if (world_rank == 0) {
-            printf("All chunks broadcasted successfully!\n");
-            fflush(stdout);
-        }
+        *count = base;
+        *start = rem * (base + 1) + (r - rem) * base;
     }
 }
 
 int main(int argc, char *argv[]) {
-    int *global_indexes = NULL;
-    int *global_indices = NULL;
+    int world_size, world_rank;
     int N = 0;
-    int total_edges = 0;
-    
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s <graph_file.mtx>\n", argv[0]);
-        return 1;
-    }
-    
+    int nnz = 0;
+
+    int *global_rowptr = NULL;
+    int *global_colind = NULL;
+
+    int *local_rowptr  = NULL;
+    int *local_colind  = NULL;
+
+    int local_start = 0;
+    int local_n = 0;
+    int local_nnz = 0;
+
+    int *colors = NULL;
+    int *global_min_colors = NULL;
+
+    struct timespec t_start, t_end;
+
+
     MPI_Init(&argc, &argv);
-    
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
-    
-    char *str = argv[1];
-    
-    if (world_rank == 0) {
-        
-        
-        FILE *test = fopen(str, "r");
-        if (test == NULL) {
-            fprintf(stderr, "Rank 0: Cannot open file %s\n", str);
-            N = -1;
-            MPI_Bcast(&N, 1, MPI_INT, 0, MPI_COMM_WORLD);
-            MPI_Finalize();
-            return 1;
+
+    if (argc < 2) {
+        if (world_rank == 0) {
+            fprintf(stderr, "Usage: %s <graph_file.mtx>\n", argv[0]);
         }
-        fclose(test);
-        
-        N = cooReader(str, &global_indexes, &global_indices);
-        N = N - 1;
-        total_edges = global_indexes[N];
-        
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
-    
+
+    char *filename = argv[1];
+
+
+    if (world_rank == 0) {
+        int Nplus1 = cooReader(filename, &global_rowptr, &global_colind);
+        if (Nplus1 <= 0) {
+            fprintf(stderr, "Rank 0: cooReader failed for %s\n", filename);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
+        N   = Nplus1 - 1;
+        nnz = global_rowptr[N];
+
+        printf("Rank 0: Read graph '%s' with N = %d, nnz = %d\n",
+               filename, N, nnz);
+        fflush(stdout);
+    }
+
+
     MPI_Bcast(&N, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    
+
     if (N <= 0) {
-        MPI_Finalize();
-        return 1;
+        if (world_rank == 0) {
+            fprintf(stderr, "Invalid N (%d). Exiting.\n", N);
+        }
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
+
+
+    get_range(N, world_size, world_rank, &local_start, &local_n);
+
+    if (world_rank == 0) {
+        printf("World size = %d, N = %d\n", world_size, N);
+        for (int r = 0; r < world_size; ++r) {
+            int s, c;
+            get_range(N, world_size, r, &s, &c);
+            printf("  Rank %d: local_start = %d, local_n = %d\n", r, s, c);
+        }
+        fflush(stdout);
+    }
+
+
+    if (world_rank == 0) {
+        for (int r = 0; r < world_size; ++r) {
+            int r_start, r_n;
+            get_range(N, world_size, r, &r_start, &r_n);
+
+            int row_begin = global_rowptr[r_start];
+            int row_end   = (r_n > 0) ? global_rowptr[r_start + r_n] : row_begin;
+            int r_nnz     = row_end - row_begin;
+
+            if (r == 0) {
+            
+                local_start = r_start;
+                local_n     = r_n;
+                local_nnz   = r_nnz;
+
+                local_rowptr = (int *)malloc((local_n + 1) * sizeof(int));
+                if (!local_rowptr) {
+                    fprintf(stderr, "Rank 0: Failed to allocate local_rowptr\n");
+                    MPI_Abort(MPI_COMM_WORLD, 1);
+                }
+            
+                for (int i = 0; i <= local_n; ++i) {
+                    local_rowptr[i] = global_rowptr[local_start + i] - row_begin;
+                }
+
+                local_colind = NULL;
+                if (local_nnz > 0) {
+                    local_colind = (int *)malloc(local_nnz * sizeof(int));
+                    if (!local_colind) {
+                        fprintf(stderr, "Rank 0: Failed to allocate local_colind\n");
+                        MPI_Abort(MPI_COMM_WORLD, 1);
+                    }
+                    for (int i = 0; i < local_nnz; ++i) {
+                        local_colind[i] = global_colind[row_begin + i];
+                    }
+                }
+
+            } else {
+            
+                MPI_Send(&r_n,     1, MPI_INT, r, 100, MPI_COMM_WORLD);
+                MPI_Send(&r_start, 1, MPI_INT, r, 101, MPI_COMM_WORLD);
+                MPI_Send(&r_nnz,   1, MPI_INT, r, 102, MPI_COMM_WORLD);
+
+            
+                int *tmp_rowptr = (int *)malloc((r_n + 1) * sizeof(int));
+                if (!tmp_rowptr) {
+                    fprintf(stderr, "Rank 0: Failed to allocate tmp_rowptr for rank %d\n", r);
+                    MPI_Abort(MPI_COMM_WORLD, 1);
+                }
+                for (int i = 0; i <= r_n; ++i) {
+                    tmp_rowptr[i] = global_rowptr[r_start + i] - row_begin;
+                }
+                MPI_Send(tmp_rowptr, r_n + 1, MPI_INT, r, 103, MPI_COMM_WORLD);
+                free(tmp_rowptr);
+
+            
+                if (r_nnz > 0) {
+                    MPI_Send(&global_colind[row_begin], r_nnz,
+                             MPI_INT, r, 104, MPI_COMM_WORLD);
+                }
+            }
+        }
+
     
-        if (world_rank != 0) {
-        global_indexes = (int*)malloc((N + 1) * sizeof(int));
-        if (global_indexes == NULL) {
-            fprintf(stderr, "Rank %d: Failed to allocate indexes\n", world_rank);
+        free(global_rowptr);
+        free(global_colind);
+        global_rowptr = NULL;
+        global_colind = NULL;
+
+    } else {
+    
+        MPI_Recv(&local_n,     1, MPI_INT, 0, 100, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Recv(&local_start, 1, MPI_INT, 0, 101, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Recv(&local_nnz,   1, MPI_INT, 0, 102, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        local_rowptr = (int *)malloc((local_n + 1) * sizeof(int));
+        if (!local_rowptr) {
+            fprintf(stderr, "Rank %d: Failed to allocate local_rowptr\n", world_rank);
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
-    }
-    
-    
-    MPI_Bcast(global_indexes, N + 1, MPI_INT, 0, MPI_COMM_WORLD);
-    
-    
-    total_edges = global_indexes[N];
-    
-    if (world_rank != 0) {
-        printf("Rank %d: Allocating %d elements (%.2f MB)...\n", 
-               world_rank, total_edges, (sizeof(int) * total_edges) / (1024.0 * 1024.0));
-        fflush(stdout);
-        
-        global_indices = (int*)malloc(total_edges * sizeof(int));
-        if (global_indices == NULL) {
-            fprintf(stderr, "Rank %d: Failed to allocate column indices\n", world_rank);
-            MPI_Abort(MPI_COMM_WORLD, 1);
+        MPI_Recv(local_rowptr, local_n + 1, MPI_INT, 0, 103, MPI_COMM_WORLD,
+                 MPI_STATUS_IGNORE);
+
+        local_colind = NULL;
+        if (local_nnz > 0) {
+            local_colind = (int *)malloc(local_nnz * sizeof(int));
+            if (!local_colind) {
+                fprintf(stderr, "Rank %d: Failed to allocate local_colind\n", world_rank);
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+            MPI_Recv(local_colind, local_nnz, MPI_INT, 0, 104, MPI_COMM_WORLD,
+                     MPI_STATUS_IGNORE);
         }
     }
-    
-    if (world_rank == 0) {
-        printf("Rank 0: Broadcasting column indices (%d elements)...\n", total_edges);
-        fflush(stdout);
-    }
-    
+
     MPI_Barrier(MPI_COMM_WORLD);
-    broadcast_large_array(global_indices, total_edges, 0);
-    MPI_Barrier(MPI_COMM_WORLD);
-    
     if (world_rank == 0) {
-        printf("Rank 0: All data broadcasted!\n");
-        fflush(stdout);
-    } else {
-        printf("Rank %d: All data received!\n", world_rank);
+        printf("CSR distributed. Starting CC computation.\n");
         fflush(stdout);
     }
-    
-    int base_size = N / world_size;
-    int remainder = N % world_size;
-    int local_start, local_n;
-    
-    if (world_rank < remainder) {
-        local_n = base_size + 1;
-        local_start = world_rank * local_n;
-    } else {
-        local_n = base_size;
-        local_start = remainder * (base_size + 1) + (world_rank - remainder) * base_size;
+
+
+    colors = (int *)malloc(N * sizeof(int));
+    global_min_colors = (int *)malloc(N * sizeof(int));
+    if (!colors || !global_min_colors) {
+        fprintf(stderr, "Rank %d: Failed to allocate color arrays\n", world_rank);
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
-    
-    int *colors = (int*)malloc(N * sizeof(int));
-    for (int i = 0; i < N; i++) {
+
+    for (int i = 0; i < N; ++i) {
         colors[i] = i;
     }
-    
+
+    MPI_Barrier(MPI_COMM_WORLD);
     if (world_rank == 0) {
         clock_gettime(CLOCK_REALTIME, &t_start);
     }
-    
-    int active = 1;
-    int iteration = 0;
-    
-    while (active) {
-        active = 0;
-        
-        for (int i = local_start; i < local_start + local_n; ++i) {
-            for (int j = global_indexes[i]; j < global_indexes[i+1]; ++j) {
-                int neighbor = global_indices[j];
-                
-                int cmin;
-                if(colors[i] < colors[neighbor]){
-                    cmin = colors[i];
-                } else {
-                    cmin = colors[neighbor];
+
+
+    int iteration     = 0;
+    int active_local  = 1;
+    int active_global = 1;
+
+    while (active_global) {
+        active_local = 0;
+
+
+        for (int li = 0; li < local_n; ++li) {
+            int i_global  = local_start + li;
+            int row_begin = local_rowptr[li];
+            int row_end   = local_rowptr[li + 1];
+
+            for (int j = row_begin; j < row_end; ++j) {
+                int neighbor = local_colind[j];
+
+                int ci = colors[i_global];
+                int cn = colors[neighbor];
+                int cmin = (ci < cn) ? ci : cn;
+
+                if (colors[i_global] != cmin) {
+                    colors[i_global] = cmin;
+                    active_local = 1;
                 }
-                
-                if(colors[i] != cmin){
-                    colors[i] = cmin;
-                    active = 1;
-                }
-                if(colors[neighbor] != cmin){
+                if (colors[neighbor] != cmin) {
                     colors[neighbor] = cmin;
-                    active = 1;
+                    active_local = 1;
                 }
             }
         }
-        
-        int *global_min_colors = (int*)malloc(N * sizeof(int));
+
+    
         MPI_Allreduce(colors, global_min_colors, N, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-        
-        for (int i = 0; i < N; i++) {
+
+    
+        for (int i = 0; i < N; ++i) {
             if (colors[i] != global_min_colors[i]) {
-                active = 1;
+                colors[i] = global_min_colors[i];
+                active_local = 1;
             }
-            colors[i] = global_min_colors[i];
         }
-        free(global_min_colors);
-        
-        int global_active;
-        MPI_Allreduce(&active, &global_active, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
-        active = global_active;
-        
+
+    
+        MPI_Allreduce(&active_local, &active_global, 1,
+                      MPI_INT, MPI_LOR, MPI_COMM_WORLD);
+
         iteration++;
     }
-    
+
     if (world_rank == 0) {
         clock_gettime(CLOCK_REALTIME, &t_end);
-        
+    }
+
+
+    if (world_rank == 0) {
+        int *uniqueFlags = (int *)calloc(N, sizeof(int));
+        if (!uniqueFlags) {
+            fprintf(stderr, "Rank 0: Failed to allocate uniqueFlags\n");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
         int numCC = 0;
-        int *uniqueFlags = (int*)calloc(N, sizeof(int));
-        for (int i = 0; i < N; i++) {
-            if (!uniqueFlags[colors[i]]) {
-                uniqueFlags[colors[i]] = 1;
+        for (int i = 0; i < N; ++i) {
+            int c = colors[i];
+            if (!uniqueFlags[c]) {
+                uniqueFlags[c] = 1;
                 numCC++;
             }
         }
-        
+
+        double duration = ((t_end.tv_sec - t_start.tv_sec) * 1e6 +
+                           (t_end.tv_nsec - t_start.tv_nsec) / 1000.0) / 1e6;
+
+        printf("Iterations: %d\n", iteration);
         printf("Number of connected components: %d\n", numCC);
-        
-        double duration = ((t_end.tv_sec - t_start.tv_sec) * 1000000.0 + 
-                          (t_end.tv_nsec - t_start.tv_nsec) / 1000.0) / 1000000.0;
         printf("~ CC duration: %lf seconds\n", duration);
-        
+        fflush(stdout);
+
         FILE *f = fopen("results.csv", "a");
         if (f != NULL) {
-            fprintf(f, "mpi,%d,%lf,%s,%d\n", world_size, duration, str, N);
+            fprintf(f, "mpi,%d,%lf,%s,%d\n", world_size, duration, filename, N);
             fclose(f);
         }
-        
+
         free(uniqueFlags);
     }
-    
+
+
     free(colors);
-    free(global_indexes);
-    free(global_indices);
-    
+    free(global_min_colors);
+    free(local_rowptr);
+    free(local_colind);
+
     MPI_Finalize();
     return 0;
 }
