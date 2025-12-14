@@ -1,9 +1,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <stdint.h>
 #include <mpi.h>
 #include "mmio.h"
 #include "converter.h"
+#include <limits.h>
 
 /* ----------------- Utility: partition vertices ----------------- */
 
@@ -57,20 +59,20 @@ static int find_gid_in_segment(int gid, const int *gids, int offset, int count, 
 
 int main(int argc, char *argv[]) {
     int world_size, world_rank;
-    int N = 0;      /* number of vertices */
-    int nnz = 0;    /* number of edges in CSR */
+    int N = 0;              /* number of vertices */
+    long long nnz = 0;      /* number of edges in CSR (64-bit counts) */
 
     /* Global CSR (on rank 0 only) */
-    int *global_rowptr = NULL;
-    int *global_colind = NULL;
+    long long *global_rowptr = NULL; /* rowptr entries are now 64-bit offsets */
+    int       *global_colind = NULL; /* colind stores vertex IDs (32-bit) */
 
     /* Local CSR */
-    int *local_rowptr  = NULL;
-    int *local_colind  = NULL;
+    long long *local_rowptr  = NULL;
+    int       *local_colind  = NULL;
 
     int local_start = 0;
     int local_n     = 0;
-    int local_nnz   = 0;
+    long long local_nnz   = 0; /* local nnz (may be large) */
 
     /* Local colors (only owned vertices) */
     int *local_colors = NULL;
@@ -117,94 +119,190 @@ int main(int argc, char *argv[]) {
 
     /* -------- 1. Rank 0 reads graph via cooReader (directed CSR) -------- */
     if (world_rank == 0) {
-        int Nplus1 = cooReader(filename, &global_rowptr, &global_colind);
+        int Nplus1 = cooReader(filename, (int**)&global_rowptr, &global_colind);
         if (Nplus1 <= 0) {
             fprintf(stderr, "Rank 0: cooReader failed for %s\n", filename);
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
         N   = Nplus1 - 1;
+        /* cooReader returned an int* rowptr; we casted it above. Convert to 64-bit values */
+        /* allocate 64-bit global_rowptr and copy */
+        long long *tmp_rowptr = (long long *)malloc((size_t)(N + 1) * sizeof(long long));
+        if (!tmp_rowptr) {
+            fprintf(stderr, "Rank 0: Failed to allocate tmp 64-bit global_rowptr\n");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        for (int i = 0; i <= N; ++i) {
+            tmp_rowptr[i] = ((int *)global_rowptr)[i];
+        }
+        /* free the original int* memory returned by cooReader (it was stored in global_rowptr) */
+        free(global_rowptr);
+        global_rowptr = tmp_rowptr;
+
         nnz = global_rowptr[N];
 
-        printf("Rank 0: Read graph '%s' with N = %d, nnz = %d (directed)\n",
-               filename, N, nnz);
+        printf("Rank 0: Read graph '%s' with N = %d, nnz = %lld (directed)\n",
+               filename, N, (long long)nnz);
         fflush(stdout);
 
-        /* -------- 1b. Symmetrise: build undirected COO and CSR -------- */
+        /* -------- 1b. Symmetrise: build undirected CSR --------
+           Implemented with 64-bit counts for NNZ and rowptr offsets; vertex IDs remain 32-bit.
+        */
 
-        long long max_sym_nnz_ll = 2LL * nnz;
-        if (max_sym_nnz_ll > 2147483647LL) {
-            fprintf(stderr, "Rank 0: symmetric nnz overflow (2*nnz too large)\n");
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-        int max_sym_nnz = (int)max_sym_nnz_ll;
-
-        int *row_coo = (int *)malloc((size_t)max_sym_nnz * sizeof(int));
-        int *col_coo = (int *)malloc((size_t)max_sym_nnz * sizeof(int));
-        if (!row_coo || !col_coo) {
-            fprintf(stderr, "Rank 0: Failed to allocate symmetric COO arrays\n");
+        /* 1) count degrees after symmetrisation (may include duplicates initially)
+           use 64-bit per-vertex degree in case a single vertex has >2^31 neighbors */
+        long long *deg = (long long *)calloc((size_t)N, sizeof(long long));
+        if (!deg) {
+            fprintf(stderr, "Rank 0: Failed to allocate deg array\n");
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
 
-        int k = 0;
         for (int u = 0; u < N; ++u) {
-            int row_begin = global_rowptr[u];
-            int row_end   = global_rowptr[u + 1];
-            for (int idx = row_begin; idx < row_end; ++idx) {
-                int v = global_colind[idx];
-
-                /* (u, v) */
-                if (k >= max_sym_nnz) {
-                    fprintf(stderr, "Rank 0: COO overflow while symmetrising\n");
-                    MPI_Abort(MPI_COMM_WORLD, 1);
-                }
-                row_coo[k] = u;
-                col_coo[k] = v;
-                k++;
-
-                /* (v, u) if not a self-loop */
-                if (u != v) {
-                    if (k >= max_sym_nnz) {
-                        fprintf(stderr, "Rank 0: COO overflow while symmetrising (2)\n");
-                        MPI_Abort(MPI_COMM_WORLD, 1);
-                    }
-                    row_coo[k] = v;
-                    col_coo[k] = u;
-                    k++;
-                }
+            long long row_begin = global_rowptr[u];
+            long long row_end   = global_rowptr[u + 1];
+            for (long long idx = row_begin; idx < row_end; ++idx) {
+                int v = global_colind[(size_t)idx];
+                /* (u,v) */
+                deg[u]++;
+                /* (v,u) if not self-loop */
+                if (u != v) deg[v]++;
             }
         }
-        int sym_nnz = k;
 
-        printf("Rank 0: Symmetrised graph: sym_nnz = %d (<= 2*nnz)\n", sym_nnz);
-        fflush(stdout);
+        /* compute total symmetric nnz and check allocation fit */
+        unsigned long long sym_nnz_ull = 0ULL;
+        for (int i = 0; i < N; ++i) sym_nnz_ull += (unsigned long long)deg[i];
 
-        int *sym_rowptr = (int *)malloc((N + 1) * sizeof(int));
-        int *sym_colind = (int *)malloc(sym_nnz * sizeof(int));
+        if (sym_nnz_ull > (unsigned long long)SIZE_MAX) {
+            fprintf(stderr, "Rank 0: symmetric nnz too large to allocate (%llu entries)\n", sym_nnz_ull);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        long long sym_nnz = (long long)sym_nnz_ull;
+
+        /* 2) allocate symmetric CSR arrays (temporary)
+           sym_rowptr is 64-bit offsets; sym_colind stores vertex IDs (int) */
+        long long *sym_rowptr = (long long *)malloc((size_t)(N + 1) * sizeof(long long));
+        int       *sym_colind = (int *)malloc((size_t)sym_nnz * sizeof(int));
         if (!sym_rowptr || !sym_colind) {
             fprintf(stderr, "Rank 0: Failed to allocate symmetric CSR arrays\n");
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
 
-        int returned = coo2csr(&sym_rowptr, &sym_colind,
-                               row_coo, col_coo,
-                               sym_nnz, N, 0);
-        if (returned != N + 1) {
-            fprintf(stderr, "Rank 0: coo2csr(sym) returned %d instead of %d\n",
-                    returned, N + 1);
+        /* build rowptr by prefix-sum of deg */
+        sym_rowptr[0] = 0;
+        for (int i = 0; i < N; ++i) {
+            sym_rowptr[i + 1] = sym_rowptr[i] + deg[i];
+        }
+
+        /* 3) fill sym_colind using per-row cursor */
+        long long *cursor = (long long *)malloc((size_t)N * sizeof(long long));
+        if (!cursor) {
+            fprintf(stderr, "Rank 0: Failed to allocate cursor array\n");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        for (int i = 0; i < N; ++i) cursor[i] = sym_rowptr[i];
+
+        for (int u = 0; u < N; ++u) {
+            long long row_begin = global_rowptr[u];
+            long long row_end   = global_rowptr[u + 1];
+            for (long long idx = row_begin; idx < row_end; ++idx) {
+                int v = global_colind[(size_t)idx];
+                /* (u,v) */
+                sym_colind[(size_t)cursor[u]++] = v;
+                /* (v,u) if not self-loop */
+                if (u != v) {
+                    sym_colind[(size_t)cursor[v]++] = u;
+                }
+            }
+        }
+
+        /* 4) sort and deduplicate each row, building final CSR (no duplicates) */
+        long long *uniq_counts = (long long *)malloc((size_t)N * sizeof(long long));
+        if (!uniq_counts) {
+            fprintf(stderr, "Rank 0: Failed to allocate uniq_counts\n");
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
 
-        free(global_rowptr);
-        free(global_colind);
-        free(row_coo);
-        free(col_coo);
+        /* sort each row and count unique entries */
+        for (int u = 0; u < N; ++u) {
+            long long a = sym_rowptr[u];
+            long long b = sym_rowptr[u + 1];
+            long long len = b - a;
+            if (len > 1) {
+                /* qsort expects size_t count and element size; cast len to size_t */
+                qsort(&sym_colind[(size_t)a], (size_t)len, sizeof(int), cmp_int);
+            }
+            long long uniq = 0;
+            int prev = -1;
+            for (long long k = a; k < b; ++k) {
+                int val = sym_colind[(size_t)k];
+                if (uniq == 0 || val != prev) {
+                    uniq++;
+                    prev = val;
+                }
+            }
+            uniq_counts[u] = uniq;
+        }
 
-        global_rowptr = sym_rowptr;
-        global_colind = sym_colind;
-        nnz           = sym_nnz;
+        /* compute new rowptr (64-bit) */
+        long long *new_rowptr = (long long *)malloc((size_t)(N + 1) * sizeof(long long));
+        if (!new_rowptr) {
+            fprintf(stderr, "Rank 0: Failed to allocate new_rowptr\n");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        new_rowptr[0] = 0;
+        unsigned long long new_nnz_ull = 0ULL;
+        for (int i = 0; i < N; ++i) {
+            new_nnz_ull += (unsigned long long)uniq_counts[i];
+            new_rowptr[i + 1] = new_rowptr[i] + uniq_counts[i];
+        }
 
-        printf("Rank 0: Using symmetrised (undirected) CSR: N = %d, sym_nnz = %d\n",
-               N, nnz);
+        if (new_nnz_ull > (unsigned long long)SIZE_MAX) {
+            fprintf(stderr, "Rank 0: deduplicated symmetric nnz too large to allocate (%llu)\n", new_nnz_ull);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        long long new_nnz = (long long)new_nnz_ull;
+
+        int *new_colind = (int *)malloc((size_t)new_nnz * sizeof(int));
+        if (!new_colind) {
+            fprintf(stderr, "Rank 0: Failed to allocate new_colind\n");
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
+        /* copy unique entries into new_colind */
+        for (int u = 0; u < N; ++u) {
+            long long a = sym_rowptr[u];
+            long long b = sym_rowptr[u + 1];
+            long long dst = new_rowptr[u];
+            int prev = -1;
+            for (long long k = a; k < b; ++k) {
+                int val = sym_colind[(size_t)k];
+                if (dst == new_rowptr[u] || val != prev) {
+                    new_colind[(size_t)dst++] = val;
+                    prev = val;
+                }
+            }
+            /* sanity: dst should equal new_rowptr[u+1] */
+            if (dst != new_rowptr[u + 1]) {
+                fprintf(stderr, "Rank 0: copy-unique mismatch for row %d (dst=%lld expected=%lld)\n",
+                        u, (long long)dst, (long long)new_rowptr[u + 1]);
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+        }
+
+        /* free temporaries and replace global CSR with symmetric CSR */
+        free(deg);
+        free(cursor);
+        free(sym_colind);
+        free(sym_rowptr);
+        free(uniq_counts);
+
+        global_rowptr = new_rowptr;
+        global_colind = new_colind;
+        nnz = new_nnz;
+
+        printf("Rank 0: Symmetrised graph (CSR, 64-bit offsets) built: N = %d, sym_nnz = %lld\n",
+               N, (long long)nnz);
         fflush(stdout);
     }
 
@@ -244,16 +342,16 @@ int main(int argc, char *argv[]) {
             int r_start, r_n;
             get_range(N, world_size, r, &r_start, &r_n);
 
-            int row_begin = global_rowptr[r_start];
-            int row_end   = (r_n > 0) ? global_rowptr[r_start + r_n] : row_begin;
-            int r_nnz     = row_end - row_begin;
+            long long row_begin = global_rowptr[r_start];
+            long long row_end   = (r_n > 0) ? global_rowptr[r_start + r_n] : row_begin;
+            long long r_nnz     = row_end - row_begin;
 
             if (r == 0) {
                 local_start = r_start;
                 local_n     = r_n;
                 local_nnz   = r_nnz;
 
-                local_rowptr = (int *)malloc((local_n + 1) * sizeof(int));
+                local_rowptr = (long long *)malloc((size_t)(local_n + 1) * sizeof(long long));
                 if (!local_rowptr) {
                     fprintf(stderr, "Rank 0: Failed to allocate local_rowptr\n");
                     MPI_Abort(MPI_COMM_WORLD, 1);
@@ -263,24 +361,28 @@ int main(int argc, char *argv[]) {
                 }
 
                 if (local_nnz > 0) {
-                    local_colind = (int *)malloc(local_nnz * sizeof(int));
+                    local_colind = (int *)malloc((size_t)local_nnz * sizeof(int));
                     if (!local_colind) {
                         fprintf(stderr, "Rank 0: Failed to allocate local_colind\n");
                         MPI_Abort(MPI_COMM_WORLD, 1);
                     }
-                    for (int i = 0; i < local_nnz; ++i) {
-                        local_colind[i] = global_colind[row_begin + i];
+                    for (long long i = 0; i < local_nnz; ++i) {
+                        local_colind[(size_t)i] = global_colind[(size_t)(row_begin + i)];
                     }
                 } else {
                     local_colind = NULL;
                 }
 
             } else {
+                /* send r_n, r_start as ints, send r_nnz as long long? we only send counts as ints,
+                   but we must send the rowptr array (64-bit offsets) so use MPI_LONG_LONG */
                 MPI_Send(&r_n,     1, MPI_INT, r, 100, MPI_COMM_WORLD);
                 MPI_Send(&r_start, 1, MPI_INT, r, 101, MPI_COMM_WORLD);
-                MPI_Send(&r_nnz,   1, MPI_INT, r, 102, MPI_COMM_WORLD);
+                /* r_nnz may be > INT_MAX; send as long long to be safe */
+                long long r_nnz_ll = r_nnz;
+                MPI_Send(&r_nnz_ll, 1, MPI_LONG_LONG, r, 102, MPI_COMM_WORLD);
 
-                int *tmp_rowptr = (int *)malloc((r_n + 1) * sizeof(int));
+                long long *tmp_rowptr = (long long *)malloc((size_t)(r_n + 1) * sizeof(long long));
                 if (!tmp_rowptr) {
                     fprintf(stderr, "Rank 0: Failed to allocate tmp_rowptr for rank %d\n", r);
                     MPI_Abort(MPI_COMM_WORLD, 1);
@@ -288,11 +390,12 @@ int main(int argc, char *argv[]) {
                 for (int i = 0; i <= r_n; ++i) {
                     tmp_rowptr[i] = global_rowptr[r_start + i] - row_begin;
                 }
-                MPI_Send(tmp_rowptr, r_n + 1, MPI_INT, r, 103, MPI_COMM_WORLD);
+                MPI_Send(tmp_rowptr, r_n + 1, MPI_LONG_LONG, r, 103, MPI_COMM_WORLD);
                 free(tmp_rowptr);
 
                 if (r_nnz > 0) {
-                    MPI_Send(&global_colind[row_begin], r_nnz,
+                    /* send the colind slice as ints */
+                    MPI_Send(&global_colind[(size_t)row_begin], (int)r_nnz,
                              MPI_INT, r, 104, MPI_COMM_WORLD);
                 }
             }
@@ -306,23 +409,30 @@ int main(int argc, char *argv[]) {
     } else {
         MPI_Recv(&local_n,     1, MPI_INT, 0, 100, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         MPI_Recv(&local_start, 1, MPI_INT, 0, 101, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        MPI_Recv(&local_nnz,   1, MPI_INT, 0, 102, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        long long tmp_local_nnz = 0;
+        MPI_Recv(&tmp_local_nnz, 1, MPI_LONG_LONG, 0, 102, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        local_nnz = tmp_local_nnz;
 
-        local_rowptr = (int *)malloc((local_n + 1) * sizeof(int));
+        local_rowptr = (long long *)malloc((size_t)(local_n + 1) * sizeof(long long));
         if (!local_rowptr) {
             fprintf(stderr, "Rank %d: Failed to allocate local_rowptr\n", world_rank);
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
-        MPI_Recv(local_rowptr, local_n + 1, MPI_INT, 0, 103, MPI_COMM_WORLD,
+        MPI_Recv(local_rowptr, local_n + 1, MPI_LONG_LONG, 0, 103, MPI_COMM_WORLD,
                  MPI_STATUS_IGNORE);
 
         if (local_nnz > 0) {
-            local_colind = (int *)malloc(local_nnz * sizeof(int));
+            if (local_nnz > INT_MAX) {
+                fprintf(stderr, "Rank %d: local_nnz (%lld) exceeds INT_MAX; chunked receive needed\n",
+                        world_rank, (long long)local_nnz);
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+            local_colind = (int *)malloc((size_t)local_nnz * sizeof(int));
             if (!local_colind) {
                 fprintf(stderr, "Rank %d: Failed to allocate local_colind\n", world_rank);
                 MPI_Abort(MPI_COMM_WORLD, 1);
             }
-            MPI_Recv(local_colind, local_nnz, MPI_INT, 0, 104, MPI_COMM_WORLD,
+            MPI_Recv(local_colind, (int)local_nnz, MPI_INT, 0, 104, MPI_COMM_WORLD,
                      MPI_STATUS_IGNORE);
         } else {
             local_colind = NULL;
@@ -346,11 +456,11 @@ int main(int argc, char *argv[]) {
         local_colors[li] = local_start + li;  /* initial label = global id */
     }
 
-    int local_end = local_start + local_n;
+    long long local_end = (long long)local_start + (long long)local_n;
 
     /* -------- 6. Build list of distinct remote neighbor vertices -------- */
-    int remote_cap = (local_nnz > 0 ? local_nnz : 1);
-    remote_gids = (int *)malloc(remote_cap * sizeof(int));
+    long long remote_cap = (local_nnz > 0 ? local_nnz : 1);
+    remote_gids = (int *)malloc((size_t)remote_cap * sizeof(int));
     if (!remote_gids) {
         fprintf(stderr, "Rank %d: Failed to allocate remote_gids\n", world_rank);
         MPI_Abort(MPI_COMM_WORLD, 1);
@@ -358,14 +468,14 @@ int main(int argc, char *argv[]) {
     total_remote = 0;
 
     for (int li = 0; li < local_n; ++li) {
-        int row_begin = local_rowptr[li];
-        int row_end   = local_rowptr[li + 1];
-        for (int j = row_begin; j < row_end; ++j) {
-            int nb = local_colind[j];  /* neighbor global id */
+        long long row_begin = local_rowptr[li];
+        long long row_end   = local_rowptr[li + 1];
+        for (long long j = row_begin; j < row_end; ++j) {
+            int nb = local_colind[(size_t)j];  /* neighbor global id */
             if (nb < local_start || nb >= local_end) {
                 if (total_remote == remote_cap) {
                     remote_cap *= 2;
-                    remote_gids = (int *)realloc(remote_gids, remote_cap * sizeof(int));
+                    remote_gids = (int *)realloc(remote_gids, (size_t)remote_cap * sizeof(int));
                     if (!remote_gids) {
                         fprintf(stderr, "Rank %d: Failed to realloc remote_gids\n", world_rank);
                         MPI_Abort(MPI_COMM_WORLD, 1);
@@ -412,7 +522,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (total_need > 0) {
-        need_gids = (int *)malloc(total_need * sizeof(int));
+        need_gids = (int *)malloc((size_t)total_need * sizeof(int));
         if (!need_gids) {
             fprintf(stderr, "Rank %d: Failed to allocate need_gids\n", world_rank);
             MPI_Abort(MPI_COMM_WORLD, 1);
@@ -453,8 +563,8 @@ int main(int argc, char *argv[]) {
     }
 
     if (total_give > 0) {
-        give_gids = (int *)malloc(total_give * sizeof(int));
-        give_lidx = (int *)malloc(total_give * sizeof(int));
+        give_gids = (int *)malloc((size_t)total_give * sizeof(int));
+        give_lidx = (int *)malloc((size_t)total_give * sizeof(int));
         if (!give_gids || !give_lidx) {
             fprintf(stderr, "Rank %d: Failed to allocate give_gids/lidx\n", world_rank);
             MPI_Abort(MPI_COMM_WORLD, 1);
@@ -487,12 +597,12 @@ int main(int argc, char *argv[]) {
     }
 
     if (total_give > 0) {
-        give_colors = (int *)malloc(total_give * sizeof(int));
+        give_colors = (int *)malloc((size_t)total_give * sizeof(int));
     } else {
         give_colors = (int *)malloc(sizeof(int));
     }
     if (total_need > 0) {
-        need_colors = (int *)malloc(total_need * sizeof(int));
+        need_colors = (int *)malloc((size_t)total_need * sizeof(int));
     } else {
         need_colors = (int *)malloc(sizeof(int));
     }
@@ -500,10 +610,9 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Rank %d: Failed to allocate color buffers\n", world_rank);
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
-
-    /* -------- NEW: precompute per-edge neighbor mapping -------- */
-    nbr_is_local = (unsigned char *)malloc((local_nnz > 0 ? local_nnz : 1) * sizeof(unsigned char));
-    nbr_index    = (int *)malloc((local_nnz > 0 ? local_nnz : 1) * sizeof(int));
+    /* -------- Precompute neighbor mapping -------- */
+    nbr_is_local = (unsigned char *)malloc((size_t)(local_nnz > 0 ? local_nnz : 1) * sizeof(unsigned char));
+    nbr_index    = (int *)malloc((size_t)(local_nnz > 0 ? local_nnz : 1) * sizeof(int));
     if (!nbr_is_local || !nbr_index) {
         fprintf(stderr, "Rank %d: Failed to allocate neighbor mapping arrays\n", world_rank);
         MPI_Abort(MPI_COMM_WORLD, 1);
@@ -511,15 +620,15 @@ int main(int argc, char *argv[]) {
 
     if (total_need > 0) {
         for (int li = 0; li < local_n; ++li) {
-            int row_begin = local_rowptr[li];
-            int row_end   = local_rowptr[li + 1];
-            for (int j = row_begin; j < row_end; ++j) {
-                int nb = local_colind[j];
+            long long row_begin = local_rowptr[li];
+            long long row_end   = local_rowptr[li + 1];
+            for (long long j = row_begin; j < row_end; ++j) {
+                int nb = local_colind[(size_t)j];
                 if (nb >= local_start && nb < local_end) {
-                    nbr_is_local[j] = 1;
-                    nbr_index[j]    = nb - local_start;
+                    nbr_is_local[(size_t)j] = 1;
+                    nbr_index[(size_t)j]    = nb - local_start;
                 } else {
-                    nbr_is_local[j] = 0;
+                    nbr_is_local[(size_t)j] = 0;
                     int owner = owner_of(nb, rank_starts, rank_counts, world_size);
                     if (owner < 0) {
                         fprintf(stderr, "Rank %d: owner_of(%d) < 0 in precompute\n",
@@ -529,19 +638,19 @@ int main(int argc, char *argv[]) {
                     int off   = need_displs[owner];
                     int count = need_counts[owner];
                     int pos   = find_gid_in_segment(nb, need_gids, off, count, world_rank);
-                    nbr_index[j] = pos;
+                    nbr_index[(size_t)j] = pos;
                 }
             }
         }
     } else {
         /* No ghosts: all neighbors are local */
         for (int li = 0; li < local_n; ++li) {
-            int row_begin = local_rowptr[li];
-            int row_end   = local_rowptr[li + 1];
-            for (int j = row_begin; j < row_end; ++j) {
-                int nb = local_colind[j];
-                nbr_is_local[j] = 1;
-                nbr_index[j]    = nb - local_start;
+            long long row_begin = local_rowptr[li];
+            long long row_end   = local_rowptr[li + 1];
+            for (long long j = row_begin; j < row_end; ++j) {
+                int nb = local_colind[(size_t)j];
+                nbr_is_local[(size_t)j] = 1;
+                nbr_index[(size_t)j]    = nb - local_start;
             }
         }
     }
@@ -578,18 +687,18 @@ int main(int argc, char *argv[]) {
         active_local = 0;
 
         for (int li = 0; li < local_n; ++li) {
-            int row_begin = local_rowptr[li];
-            int row_end   = local_rowptr[li + 1];
+            long long row_begin = local_rowptr[li];
+            long long row_end   = local_rowptr[li + 1];
 
             int old_color = local_colors[li];
             int new_color = old_color;
 
-            for (int j = row_begin; j < row_end; ++j) {
+            for (long long j = row_begin; j < row_end; ++j) {
                 int cn;
-                if (nbr_is_local[j]) {
-                    cn = local_colors[nbr_index[j]];
+                if (nbr_is_local[(size_t)j]) {
+                    cn = local_colors[nbr_index[(size_t)j]];
                 } else {
-                    cn = need_colors[nbr_index[j]];
+                    cn = need_colors[nbr_index[(size_t)j]];
                 }
                 if (cn < new_color) {
                     new_color = cn;
@@ -618,7 +727,7 @@ int main(int argc, char *argv[]) {
     int *gath_displs   = NULL;
 
     if (world_rank == 0) {
-        global_colors = (int *)malloc(N * sizeof(int));
+        global_colors = (int *)malloc((size_t)N * sizeof(int));
         gath_counts   = (int *)malloc(world_size * sizeof(int));
         gath_displs   = (int *)malloc(world_size * sizeof(int));
         if (!global_colors || !gath_counts || !gath_displs) {
